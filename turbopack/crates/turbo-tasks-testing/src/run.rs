@@ -1,24 +1,24 @@
 use std::{env, fmt::Debug, future::Future, sync::Arc};
 
 use anyhow::Result;
-use turbo_tasks::{TurboTasks, TurboTasksApi, trace::TraceRawVcs};
-use turbo_tasks_backend::{BackingStorage, TurboTasksBackend};
+use turbo_tasks::{TurboTasks, trace::TraceRawVcs};
+use turbo_tasks_backend::{TurboBackingStorage, TurboTasksBackend};
 
-/// A freshly created test instance: the `TurboTasks` handle (type-erased to
-/// `Arc<dyn TurboTasksApi>`) and a closure that, when called, takes a
-/// snapshot and evicts all evictable tasks on that instance.
-///
-/// The eviction closure captures the concrete backend type internally so
-/// harness code holding an erased `TurboTasksApi` can still reach the
-/// `snapshot_and_evict` API.
+/// Concrete `TurboTasks` arc used by every test harness in the workspace.
+/// All `test_config.trs` files in this workspace produce this exact type,
+/// so the test surface can hold it directly instead of going through the
+/// type-erased `TurboTasksHandle`.
+pub type TestTurboTasks = Arc<TurboTasks<TurboTasksBackend<TurboBackingStorage>>>;
+
+/// A freshly created test instance: the concrete `TurboTasks` arc and a
+/// closure that, when called, takes a snapshot and evicts all evictable
+/// tasks on that instance.
 pub struct TestInstance {
-    pub tt: Arc<dyn TurboTasksApi>,
+    pub tt: TestTurboTasks,
     pub snapshot_and_evict: Box<dyn Fn() + Send + Sync>,
 }
 
-/// Type-erased factory returned by the `register!` macro. Stays non-generic so
-/// call sites can write `static REGISTRATION: Registration = register!();`
-/// without naming the backing storage type.
+/// Factory returned by the `register!` macro.
 pub struct Registration {
     create_turbo_tasks: fn(&str, bool) -> TestInstance,
 }
@@ -34,14 +34,10 @@ impl Registration {
     }
 }
 
-/// Wrap a concrete `Arc<TurboTasks<TurboTasksBackend<B>>>` into a
-/// [`TestInstance`]. Called from the `register!` macro — the `.trs` closure
-/// returns a concrete backend-parameterized `TurboTasks`, and this function
-/// erases the type while retaining eviction access via a capturing closure.
-pub fn test_instance<B>(tt: Arc<TurboTasks<TurboTasksBackend<B>>>) -> TestInstance
-where
-    B: BackingStorage + 'static,
-{
+/// Wrap a concrete `TestTurboTasks` into a [`TestInstance`]. Called from
+/// the `register!` macro — the `.trs` closure returns the concrete arc,
+/// and this function attaches an eviction closure for the test harness.
+pub fn test_instance(tt: TestTurboTasks) -> TestInstance {
     let tt_for_evict = tt.clone();
     let snapshot_and_evict = Box::new(move || {
         let _ = tt_for_evict
@@ -49,7 +45,7 @@ where
             .snapshot_and_evict_for_testing(&*tt_for_evict);
     });
     TestInstance {
-        tt: tt as Arc<dyn TurboTasksApi>,
+        tt,
         snapshot_and_evict,
     }
 }
@@ -77,7 +73,9 @@ where
 {
     let name = closure_to_name(&fut);
     let instance = registration.create_turbo_tasks(&name, true);
-    turbo_tasks::run_once(instance.tt, async move { Ok(fut.await) })
+    instance
+        .tt
+        .run_once(async move { Ok(fut.await) })
         .await
         .unwrap()
 }
@@ -91,9 +89,7 @@ where
 {
     let name = closure_to_name(&fut);
     let instance = registration.create_turbo_tasks(&name, true);
-    turbo_tasks::run(instance.tt, async move { Ok(fut.await) })
-        .await
-        .unwrap()
+    instance.tt.run(async move { Ok(fut.await) }).await.unwrap()
 }
 
 fn closure_to_name<T>(value: &T) -> String {
@@ -109,7 +105,11 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Debug + PartialEq + Eq + TraceRawVcs + Send + 'static,
 {
-    run_with_tt(registration, move |tt| turbo_tasks::run_once(tt, fut())).await
+    run_with_tt(registration, move |tt| {
+        let f = fut();
+        async move { tt.run_once(f).await }
+    })
+    .await
 }
 
 pub async fn run<T, F>(
@@ -120,12 +120,16 @@ where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Debug + PartialEq + Eq + TraceRawVcs + Send + 'static,
 {
-    run_with_tt(registration, move |tt| turbo_tasks::run(tt, fut())).await
+    run_with_tt(registration, move |tt| {
+        let f = fut();
+        async move { Ok(tt.run(f).await?) }
+    })
+    .await
 }
 
 pub async fn run_with_tt<T, F>(
     registration: &Registration,
-    mut fut: impl FnMut(Arc<dyn TurboTasksApi>) -> F + Send + 'static,
+    mut fut: impl FnMut(TestTurboTasks) -> F + Send + 'static,
 ) -> Result<()>
 where
     F: Future<Output = Result<T>> + Send + 'static,
