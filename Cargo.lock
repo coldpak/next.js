@@ -9885,6 +9885,7 @@ dependencies = [
  "serde_path_to_error",
  "smallvec",
  "tempfile",
+ "thiserror 1.0.69",
  "thread_local",
  "tokio",
  "tracing",
