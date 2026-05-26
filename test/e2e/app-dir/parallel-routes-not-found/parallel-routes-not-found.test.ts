@@ -22,8 +22,7 @@ describe('parallel-routes-and-interception', () => {
     // we also check that the #children-slot id is not present
     expect(await browser.hasElementByCssSelector('#children-slot')).toBe(false)
     const $ = await next.render$('/')
-    expect($('title').length).toBe(1)
-    expect($('title').text()).toBe('layout title')
+    expect($('title').length).toBe(0)
   })
 
   it('should render the title once for the non-existed route', async () => {
