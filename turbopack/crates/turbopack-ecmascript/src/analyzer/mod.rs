@@ -27,7 +27,6 @@ use turbo_rcstr::{RcStr, rcstr};
 use turbo_tasks::{FxIndexMap, FxIndexSet, Vc};
 use turbopack_core::compile_time_info::{
     CompileTimeDefineValue, DefinableNameSegmentRef, DefinableNameSegmentRefs, FreeVarReference,
-    TotalOrderF64,
 };
 
 use self::imports::ImportAnnotations;
@@ -46,7 +45,7 @@ pub mod side_effects;
 pub mod top_level_await;
 pub mod well_known;
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub enum ObjectPart {
     KeyValue(JsValue, JsValue),
     Spread(JsValue),
@@ -58,15 +57,22 @@ impl Default for ObjectPart {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ConstantNumber(pub TotalOrderF64);
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstantNumber(pub f64);
 
 impl ConstantNumber {
     pub fn as_u32_index(&self) -> Option<usize> {
-        let index: u32 = *self.0 as u32;
-        (index as f64 == *self.0).then_some(index as usize)
+        let index: u32 = self.0 as u32;
+        (index as f64 == self.0).then_some(index as usize)
     }
 }
+
+impl Hash for ConstantNumber {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_ne_bytes().hash(state);
+    }
+}
+
 impl From<f64> for ConstantNumber {
     fn from(value: f64) -> Self {
         ConstantNumber(value.into())
@@ -150,7 +156,7 @@ impl From<RcStr> for ConstantString {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Hash)]
 pub enum ConstantValue {
     #[default]
     Undefined,
@@ -184,7 +190,7 @@ impl ConstantValue {
             Self::Undefined | Self::False | Self::Null => false,
             Self::True | Self::Regex(..) => true,
             Self::Str(s) => !s.is_empty(),
-            Self::Num(ConstantNumber(n)) => **n != 0.0,
+            Self::Num(ConstantNumber(n)) => *n != 0.0,
             Self::BigInt(n) => !n.is_zero(),
         }
     }
@@ -396,7 +402,7 @@ impl Display for LogicalProperty {
 /// - Replace all built-in functions with their values when they are compile-time constant.
 /// - For optimization, any nested operations are replaced with [JsValue::Unknown]. So only one
 ///   layer of operation remains. Any remaining operation or placeholder can be treated as unknown.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub enum JsValue {
     // LEAF VALUES
     // ----------------------------
@@ -513,7 +519,7 @@ pub enum JsValue {
 /// (`MemberCall(total, obj, prop, [args])`) by writing obj/prop/args as siblings inside the
 /// parent's `debug_tuple`. This keeps fixture snapshots identical to the 4-tuple-payload
 /// version without forcing a hand-written `Debug` on every `JsValue` arm.
-#[derive(Default, Clone, Hash, PartialEq, Eq)]
+#[derive(Default, Clone, Hash, PartialEq)]
 pub struct MemberCallList(Vec<JsValue>);
 
 impl fmt::Debug for MemberCallList {
@@ -638,7 +644,7 @@ impl MemberCallList {
 ///
 /// The custom `Debug` impl re-emits the pre-refactor `(callee, [args])` shape so fixture
 /// snapshots remain identical to the 3-tuple-payload version.
-#[derive(Default, Clone, Hash, PartialEq, Eq)]
+#[derive(Default, Clone, Hash, PartialEq)]
 pub struct CallList(Vec<JsValue>);
 
 impl fmt::Debug for CallList {
@@ -800,7 +806,7 @@ impl TryFrom<&CompileTimeDefineValue> for JsValue {
             CompileTimeDefineValue::Undefined => ConstantValue::Undefined,
             CompileTimeDefineValue::Null => ConstantValue::Null,
             CompileTimeDefineValue::Bool(b) => (*b).into(),
-            CompileTimeDefineValue::Number(n) => ConstantValue::Num(ConstantNumber(*n)),
+            CompileTimeDefineValue::Number(n) => ConstantValue::Num(ConstantNumber(**n)),
             CompileTimeDefineValue::BigInt(n) => ConstantValue::BigInt(n.clone()),
             CompileTimeDefineValue::String(s) => s.as_str().into(),
             CompileTimeDefineValue::Regex(pattern, flags) => {
@@ -848,7 +854,7 @@ impl TryFrom<&ConstantValue> for CompileTimeDefineValue {
             ConstantValue::Null => CompileTimeDefineValue::Null,
             ConstantValue::True => CompileTimeDefineValue::Bool(true),
             ConstantValue::False => CompileTimeDefineValue::Bool(false),
-            ConstantValue::Num(n) => CompileTimeDefineValue::Number(n.0),
+            ConstantValue::Num(n) => CompileTimeDefineValue::Number(n.0.into()),
             ConstantValue::Str(s) => CompileTimeDefineValue::String(s.as_rcstr()),
             ConstantValue::BigInt(n) => CompileTimeDefineValue::BigInt(n.clone()),
             ConstantValue::Regex(regex) => CompileTimeDefineValue::Regex(
@@ -3699,7 +3705,7 @@ impl Hash for RequireContextValue {
 }
 
 /// A list of well-known functions that have special meaning in the analysis.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq)]
 pub enum WellKnownFunctionKind {
     ArrayFilter,
     ArrayForEach,
