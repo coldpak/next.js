@@ -12,6 +12,8 @@
 //!   sibling keys stay short-circuited.
 //! - Adding / removing effects from the emitted set behaves consistently: new keys run once,
 //!   removed keys' applies do not re-fire.
+//! - Sibling producers writing the same key force `EffectsError::Retry` when an `Effects` value's
+//!   per-key state has been overwritten by another producer after its captured Vec was dropped.
 
 #![feature(arbitrary_self_types)]
 #![feature(arbitrary_self_types_pointers)]
@@ -26,8 +28,9 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use turbo_tasks::{
-    CapturedEffect, Effect, EffectStateStorage, Effects, NonLocalValue, OperationValue, ReadRef,
-    ResolvedVc, State, TurboTasks, Vc, emit_effect, take_effects, trace::TraceRawVcs,
+    ApplyOutcome, CapturedEffect, Effect, EffectStateStorage, Effects, EffectsError, NonLocalValue,
+    OperationValue, ReadRef, ResolvedVc, State, TurboTasks, Vc, emit_effect, take_effects,
+    trace::TraceRawVcs,
 };
 use turbo_tasks_backend::{
     BackendOptions, NoopBackingStorage, TurboTasksBackend, noop_backing_storage,
@@ -39,22 +42,26 @@ use turbo_tasks_backend::{
 
 /// Per-test counters + `EffectStateStorage`. Tests assert against
 /// `applies_by_key` to check how many times each effect ran.
+///
+/// A single `Shared` can be associated with multiple `TestInput` cells (each
+/// representing a separate producer task); they then share the same
+/// `EffectStateStorage`, mirroring how on disk two producers writing the
+/// same path contend on the same per-key state entry.
 #[derive(TraceRawVcs, NonLocalValue)]
 struct Shared {
     #[turbo_tasks(trace_ignore)]
     applies_by_key: Mutex<FxHashMap<u32, u64>>,
     #[turbo_tasks(trace_ignore)]
     total_applies: AtomicU64,
-    /// Shared `EffectStateStorage` returned by `CapturedEffect::state_storage`.
+    /// Counts captures that materialized content (i.e. those where
+    /// `EffectStateStorage::matches_applied` returned false). Lets tests
+    /// assert that capture skipped content materialization on re-runs.
+    #[turbo_tasks(trace_ignore)]
+    captures_with_content: AtomicU64,
+    /// Shared `EffectStateStorage` used by both `matches_applied` (in `capture`)
+    /// and `run_apply` (in `apply`).
     #[turbo_tasks(trace_ignore)]
     state_storage: EffectStateStorage,
-    /// Spec driving what the producer emits. Lives in `Shared` (not in the
-    /// `TestInput` cell) so the test body can mutate it directly at top-level
-    /// via the `Arc<Shared>` handle, without going through a cached operation.
-    /// Mutating from inside a cached operation would make the operation
-    /// non-deterministic.
-    #[turbo_tasks(trace_ignore)]
-    spec: State<EmitSpec>,
 }
 
 impl Shared {
@@ -62,8 +69,8 @@ impl Shared {
         Arc::new(Self {
             applies_by_key: Mutex::new(Default::default()),
             total_applies: AtomicU64::new(0),
+            captures_with_content: AtomicU64::new(0),
             state_storage: EffectStateStorage::default(),
-            spec: State::new(EmitSpec::default()),
         })
     }
 
@@ -74,6 +81,10 @@ impl Shared {
     fn total(&self) -> u64 {
         self.total_applies.load(Ordering::Relaxed)
     }
+
+    fn captures_with_content(&self) -> u64 {
+        self.captures_with_content.load(Ordering::Relaxed)
+    }
 }
 
 // =============================================================================
@@ -81,19 +92,37 @@ impl Shared {
 // =============================================================================
 
 #[derive(TraceRawVcs, NonLocalValue)]
-struct TestEffectEmit {
+struct TestEffect {
     key: u32,
     value_hash: u128,
     shared: Arc<Shared>,
 }
 
-impl Effect for TestEffectEmit {
+impl Effect for TestEffect {
     type Captured = TestEffectCaptured;
 
     async fn capture(&self) -> Result<TestEffectCaptured> {
+        // Consult storage. If the per-key state already records `Applied { value_hash }`
+        // matching our hash, elide content materialization (`content = false`). Otherwise
+        // bump the captures-with-content counter (the test's stand-in for a `ReadRef` /
+        // disk-read at this point).
+        let key_bytes: Box<[u8]> = self.key.to_le_bytes().into();
+        let content = if self
+            .shared
+            .state_storage
+            .matches_applied(&key_bytes, self.value_hash)
+        {
+            false
+        } else {
+            self.shared
+                .captures_with_content
+                .fetch_add(1, Ordering::Relaxed);
+            true
+        };
         Ok(TestEffectCaptured {
             key: self.key,
             value_hash: self.value_hash,
+            content,
             shared: self.shared.clone(),
         })
     }
@@ -103,12 +132,13 @@ impl Effect for TestEffectEmit {
 struct TestEffectCaptured {
     key: u32,
     value_hash: u128,
+    /// Whether `capture` materialized content. When `false`, `apply` passes `None` to
+    /// `run_apply`; a non-matching storage state then triggers `ApplyOutcome::Retry`.
+    content: bool,
     shared: Arc<Shared>,
 }
 
 impl CapturedEffect for TestEffectCaptured {
-    type Error = TestError;
-
     fn key(&self) -> Box<[u8]> {
         self.key.to_le_bytes().into()
     }
@@ -117,19 +147,25 @@ impl CapturedEffect for TestEffectCaptured {
         self.value_hash
     }
 
-    fn state_storage(&self) -> &EffectStateStorage {
-        &self.shared.state_storage
-    }
-
-    async fn apply(&self) -> Result<(), TestError> {
-        self.shared.total_applies.fetch_add(1, Ordering::Relaxed);
-        *self
-            .shared
-            .applies_by_key
-            .lock()
-            .entry(self.key)
-            .or_insert(0) += 1;
-        Ok(())
+    async fn apply(&self) -> Result<(), ApplyOutcome<Arc<dyn turbo_tasks::EffectError>>> {
+        let body = if self.content {
+            Some(|| async {
+                self.shared.total_applies.fetch_add(1, Ordering::Relaxed);
+                *self
+                    .shared
+                    .applies_by_key
+                    .lock()
+                    .entry(self.key)
+                    .or_insert(0) += 1;
+                Ok::<(), TestError>(())
+            })
+        } else {
+            None
+        };
+        self.shared
+            .state_storage
+            .run_apply::<TestError, _, _>(self.key(), self.value_hash, body)
+            .await
     }
 }
 
@@ -154,13 +190,28 @@ struct EmitSpec {
     pairs: Vec<(u32, u64)>,
 }
 
-/// Input cell. Just holds an `Arc<Shared>`. The `State<EmitSpec>` that
-/// drives the producer lives inside `Shared` (see [`Shared::spec`]) so it
-/// can be mutated from top-level outside any cached operation.
+/// Input cell. Holds an `Arc<Shared>` (counters + `EffectStateStorage`) plus
+/// its own `Arc<State<EmitSpec>>` driving what *this* producer emits. The
+/// spec lives in an `Arc<State<…>>` rather than in the cell value so the
+/// test body can mutate it from top-level via the handle returned by
+/// `TestInput::new`, without going through a cached operation. Mutating from
+/// inside a cached operation would make the operation non-deterministic.
+///
+/// Multiple `TestInput`s can share one `Arc<Shared>` (so they contend on the
+/// same `EffectStateStorage`) while each carries its own independent spec —
+/// this is what lets us simulate two sibling producers writing the same key
+/// in the retry test.
 #[turbo_tasks::value(eq = "manual", serialization = "skip")]
 struct TestInput {
     #[turbo_tasks(trace_ignore, debug_ignore)]
     shared: Arc<Shared>,
+    #[turbo_tasks(trace_ignore, debug_ignore)]
+    spec: Arc<State<EmitSpec>>,
+    /// Side-channel `State` for invalidating the producer without changing
+    /// `spec`. Lets tests simulate upstream input changes that don't affect
+    /// emitted hashes (e.g. a comment edit that recompiles to identical bytes).
+    #[turbo_tasks(trace_ignore, debug_ignore)]
+    tick: Arc<State<u64>>,
 }
 
 impl PartialEq for TestInput {
@@ -170,16 +221,35 @@ impl PartialEq for TestInput {
 }
 
 impl TestInput {
-    /// Construct a fresh `TestInput` cell. Returns the `ResolvedVc` alongside
-    /// an `Arc<Shared>` clone so the test body can mutate the spec and assert
-    /// against the apply counters without doing any Vc reads.
-    fn new() -> (ResolvedVc<Self>, Arc<Shared>) {
-        let shared = Shared::new();
+    /// Construct a fresh `TestInput` cell with a fresh `Shared`.
+    fn new() -> (
+        ResolvedVc<Self>,
+        Arc<Shared>,
+        Arc<State<EmitSpec>>,
+        Arc<State<u64>>,
+    ) {
+        Self::new_with_shared(Shared::new())
+    }
+
+    /// Construct a fresh `TestInput` cell that shares an existing `Shared`.
+    /// The new input has its own independent spec.
+    fn new_with_shared(
+        shared: Arc<Shared>,
+    ) -> (
+        ResolvedVc<Self>,
+        Arc<Shared>,
+        Arc<State<EmitSpec>>,
+        Arc<State<u64>>,
+    ) {
+        let spec = Arc::new(State::new(EmitSpec::default()));
+        let tick = Arc::new(State::new(0u64));
         let cell = Self {
             shared: shared.clone(),
+            spec: spec.clone(),
+            tick: tick.clone(),
         }
         .resolved_cell();
-        (cell, shared)
+        (cell, shared, spec, tick)
     }
 }
 
@@ -187,9 +257,11 @@ impl TestInput {
 async fn producer_operation(input: ResolvedVc<TestInput>) -> Result<()> {
     let input = input.await?;
     let shared = input.shared.clone();
-    let spec = shared.spec.get().clone();
+    let spec = input.spec.get().clone();
+    // Track `tick` so callers can force a producer rerun without mutating `spec`.
+    let _tick: u64 = *input.tick.get();
     for (key, value_hash) in spec.pairs {
-        emit_effect(TestEffectEmit {
+        emit_effect(TestEffect {
             key,
             value_hash: value_hash as u128,
             shared: shared.clone(),
@@ -200,8 +272,8 @@ async fn producer_operation(input: ResolvedVc<TestInput>) -> Result<()> {
 
 /// Read the current spec from `input` and emit the corresponding effects,
 /// returning the captured `Effects`. State mutation must happen OUTSIDE this
-/// operation (at top-level via `set_spec`), otherwise the operation becomes
-/// non-deterministic and turbo-tasks may re-run it with stale inputs.
+/// operation (at top-level via the spec handle), otherwise the operation
+/// becomes non-deterministic and turbo-tasks may re-run it with stale inputs.
 #[turbo_tasks::function(operation, root)]
 async fn extract_effects(input: ResolvedVc<TestInput>) -> Result<Vc<Effects>> {
     let producer = producer_operation(input);
@@ -209,16 +281,16 @@ async fn extract_effects(input: ResolvedVc<TestInput>) -> Result<Vc<Effects>> {
     Ok(take_effects(producer).await?.cell())
 }
 
-/// Mutate the spec on the shared handle and return the resulting `Effects`.
-/// State mutation is synchronous at top-level (so it doesn't make any
-/// operation non-deterministic); only the `take_effects` step runs inside an
-/// operation root so it gets strongly-consistent read semantics.
+/// Mutate the spec via its top-level handle and return the resulting
+/// `Effects`. State mutation is synchronous at top-level (so it doesn't make
+/// any operation non-deterministic); only the `take_effects` step runs
+/// inside an operation root so it gets strongly-consistent read semantics.
 async fn emit_and_take(
-    shared: &Shared,
+    spec: &State<EmitSpec>,
     input: ResolvedVc<TestInput>,
     pairs: Vec<(u32, u64)>,
 ) -> Result<ReadRef<Effects>> {
-    shared.spec.set(EmitSpec { pairs });
+    spec.set(EmitSpec { pairs });
     Ok(extract_effects(input).read_strongly_consistent().await?)
 }
 
@@ -246,9 +318,9 @@ fn create_tt() -> Arc<TurboTasks<TurboTasksBackend<NoopBackingStorage>>> {
 async fn duplicate_apply_runs_once() {
     let tt = create_tt();
     tt.run_once(async move {
-        let (input, shared) = TestInput::new();
+        let (input, shared, spec, _tick) = TestInput::new();
 
-        let effects = emit_and_take(&shared, input, vec![(1, 0xAAAA)]).await?;
+        let effects = emit_and_take(&spec, input, vec![(1, 0xAAAA)]).await?;
 
         effects.apply().await?;
         assert_eq!(shared.applies_for(1), 1, "first apply runs the effect");
@@ -275,9 +347,9 @@ async fn duplicate_apply_runs_once() {
 async fn reemit_unchanged_hash_does_not_reapply() {
     let tt = create_tt();
     tt.run_once(async move {
-        let (input, shared) = TestInput::new();
+        let (input, shared, spec, _tick) = TestInput::new();
 
-        emit_and_take(&shared, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
@@ -286,7 +358,7 @@ async fn reemit_unchanged_hash_does_not_reapply() {
         // Re-set with the same value. `State::set` is a no-op when the value
         // hasn't changed (PartialEq), but the second `extract_effects` invocation
         // is still a fresh root task — it re-takes the producer's collectibles.
-        emit_and_take(&shared, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
@@ -308,9 +380,9 @@ async fn reemit_unchanged_hash_does_not_reapply() {
 async fn hash_change_reapplies_only_changed_key() {
     let tt = create_tt();
     tt.run_once(async move {
-        let (input, shared) = TestInput::new();
+        let (input, shared, spec, _tick) = TestInput::new();
 
-        emit_and_take(&shared, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
@@ -318,7 +390,7 @@ async fn hash_change_reapplies_only_changed_key() {
         assert_eq!(shared.applies_for(2), 1);
 
         // Change key 1's hash; leave key 2 alone.
-        emit_and_take(&shared, input, vec![(1, 0xCCCC), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xCCCC), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
@@ -345,16 +417,16 @@ async fn hash_change_reapplies_only_changed_key() {
 async fn adding_effect_only_runs_new_key() {
     let tt = create_tt();
     tt.run_once(async move {
-        let (input, shared) = TestInput::new();
+        let (input, shared, spec, _tick) = TestInput::new();
 
-        emit_and_take(&shared, input, vec![(1, 0xAAAA)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA)])
             .await?
             .apply()
             .await?;
         assert_eq!(shared.total(), 1);
 
         // Add a new effect, key 2.
-        emit_and_take(&shared, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
@@ -373,16 +445,16 @@ async fn adding_effect_only_runs_new_key() {
 async fn removing_effect_does_not_reapply_survivors() {
     let tt = create_tt();
     tt.run_once(async move {
-        let (input, shared) = TestInput::new();
+        let (input, shared, spec, _tick) = TestInput::new();
 
-        emit_and_take(&shared, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA), (2, 0xBBBB)])
             .await?
             .apply()
             .await?;
         assert_eq!(shared.total(), 2);
 
         // Drop key 2.
-        emit_and_take(&shared, input, vec![(1, 0xAAAA)])
+        emit_and_take(&spec, input, vec![(1, 0xAAAA)])
             .await?
             .apply()
             .await?;
@@ -392,6 +464,243 @@ async fn removing_effect_does_not_reapply_survivors() {
             shared.applies_for(2),
             1,
             "key 2 was removed; its apply must not run again"
+        );
+
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap()
+}
+
+/// When sibling producers write the same key with different hashes, A's
+/// re-apply (on the same `Effects` value) re-fires A's side effect because
+/// the per-key state machine sees `Applied { H_B } != H_A` → break into
+/// InProgress, run body, write back `Applied { H_A }`. Captured effects are
+/// kept alive for the lifetime of the cell so re-apply always has a body to
+/// run; there is no Retry signal in this scenario because the test effects
+/// don't elide content at capture time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_producer_overwrites_state_reapplies_on_call() {
+    let tt = create_tt();
+    tt.run_once(async move {
+        let (input_a, shared, spec_a, _tick_a) = TestInput::new();
+        let (input_b, _shared_b, spec_b, _tick_b) = TestInput::new_with_shared(shared.clone());
+
+        // Step 1: A emits and applies (key=1, hash=H1).
+        spec_a.set(EmitSpec {
+            pairs: vec![(1, 0xAAAA)],
+        });
+        let op_a = extract_effects(input_a);
+        let effects_a = op_a.read_strongly_consistent().await?;
+        effects_a.apply().await?;
+        assert_eq!(shared.applies_for(1), 1, "A's first apply ran");
+
+        // Step 2: B emits and applies (key=1, hash=H2). Different hash for the
+        // same key overwrites the per-key state entry.
+        emit_and_take(&spec_b, input_b, vec![(1, 0xBBBB)])
+            .await?
+            .apply()
+            .await?;
+        assert_eq!(shared.applies_for(1), 2, "B's apply for the same key ran");
+
+        // Step 3: re-apply A's original Effects. Captured slice is still alive
+        // (Effects keeps captured for the cell's lifetime; cell="new" drops it
+        // when the producer reruns), so the state machine breaks into InProgress
+        // and re-runs A's body, then writes back Applied{H_A}.
+        effects_a.apply().await?;
+        assert_eq!(
+            shared.applies_for(1),
+            3,
+            "A's re-apply against stomped state re-fires its body"
+        );
+
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap()
+}
+
+/// When `Effects::apply` is called twice in sequence on the same value, the
+/// second call short-circuits via the per-key dedup hit. This works because
+/// `Effects` keeps `captured` alive for the lifetime of the cell, so every
+/// apply re-enters the state machine; with storage `Applied{H_A}` matching
+/// the captured hash H_A, the state machine returns the cached result
+/// without invoking the body a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_apply_after_unchanged_state_dedupes() {
+    let tt = create_tt();
+    tt.run_once(async move {
+        let (input, shared, spec, _tick) = TestInput::new();
+
+        spec.set(EmitSpec {
+            pairs: vec![(1, 0xAAAA)],
+        });
+        let op = extract_effects(input);
+        let effects = op.read_strongly_consistent().await?;
+        effects.apply().await?;
+        assert_eq!(shared.applies_for(1), 1);
+
+        effects.apply().await?;
+        assert_eq!(
+            shared.applies_for(1),
+            1,
+            "second apply with unchanged state must dedup-hit",
+        );
+
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap()
+}
+
+/// Holding on to `effects_a`, deliberately suppress the test from holding
+/// `ReadRef` references that would prevent eviction. We confirm referential
+/// behavior: after a sibling stomps storage and A is invalidated and re-read,
+/// the new `Effects` cell is a different value (cell = "new").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cell_new_produces_distinct_effects_per_producer_run() {
+    let tt = create_tt();
+    tt.run_once(async move {
+        let (input, _shared, spec, _tick) = TestInput::new();
+
+        spec.set(EmitSpec {
+            pairs: vec![(1, 0xAAAA)],
+        });
+        let op = extract_effects(input);
+        let effects_v1 = op.read_strongly_consistent().await?;
+
+        // Mutate spec to invalidate the producer.
+        spec.set(EmitSpec {
+            pairs: vec![(1, 0xBBBB)],
+        });
+        let effects_v2 = op.read_strongly_consistent().await?;
+
+        assert!(
+            !ReadRef::ptr_eq(&effects_v1, &effects_v2),
+            "cell = \"new\" must allocate a fresh cell value on producer rerun"
+        );
+
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap()
+}
+
+/// When the producer reruns with the same `(key, value_hash)` after the first
+/// apply succeeded, `capture` observes storage `Applied{matching}` and elides
+/// content materialization. The apply-side state machine still dedup-hits
+/// because storage is unchanged, so the side effect does not re-fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_skips_content_when_storage_matches() {
+    let tt = create_tt();
+    tt.run_once(async move {
+        let (input, shared, spec, tick) = TestInput::new();
+
+        spec.set(EmitSpec {
+            pairs: vec![(1, 0xAAAA)],
+        });
+        let op = extract_effects(input);
+        op.read_strongly_consistent().await?.apply().await?;
+        assert_eq!(shared.applies_for(1), 1, "first apply ran");
+        assert_eq!(
+            shared.captures_with_content(),
+            1,
+            "first capture had to materialize (storage was empty)"
+        );
+
+        // Force the producer to rerun without changing what it emits (simulates
+        // an upstream input change that doesn't affect the output). Storage
+        // still holds `Applied{0xAAAA}` so capture's `matches_applied` returns
+        // true and we skip content materialization. Apply dedup-hits via the
+        // state machine.
+        tick.set(1);
+        op.read_strongly_consistent().await?.apply().await?;
+        assert_eq!(
+            shared.applies_for(1),
+            1,
+            "re-emit with unchanged state must not re-run apply",
+        );
+        assert_eq!(
+            shared.captures_with_content(),
+            1,
+            "second capture must skip content materialization",
+        );
+
+        anyhow::Ok(())
+    })
+    .await
+    .unwrap()
+}
+
+/// Race scenario: A's capture observed `Applied{H_A}` and elided content
+/// materialization. Before A's apply runs, B applies a different hash for the
+/// same key, stomping storage to `Applied{H_B}`. A's apply now sees the
+/// mismatch but has no content — `ApplyOutcome::Retry` propagates as
+/// `EffectsError::Retry`. The producer's invalidator fires; re-reading A
+/// produces a fresh `Effects` whose `capture` sees the mismatch and
+/// materializes content this time, so the second apply succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_skip_then_stomp_signals_retry() {
+    let tt = create_tt();
+    tt.run_once(async move {
+        let (input_a, shared, spec_a, tick_a) = TestInput::new();
+        let (input_b, _shared_b, spec_b, _tick_b) = TestInput::new_with_shared(shared.clone());
+
+        // T1: A applies (key=1, H_A). Storage = Applied{H_A}. Capture had to
+        // materialize (storage was empty).
+        spec_a.set(EmitSpec {
+            pairs: vec![(1, 0xAAAA)],
+        });
+        let op_a = extract_effects(input_a);
+        op_a.read_strongly_consistent().await?.apply().await?;
+        assert_eq!(shared.applies_for(1), 1);
+        assert_eq!(shared.captures_with_content(), 1);
+
+        // T2: Force the producer to rerun by bumping `tick` (simulates an upstream
+        // input change that doesn't affect the emitted hashes). Storage still
+        // holds Applied{H_A}, so capture's matches_applied returns true and we
+        // elide content materialization.
+        tick_a.set(1);
+        let effects_a_skipped = op_a.read_strongly_consistent().await?;
+        assert_eq!(
+            shared.captures_with_content(),
+            1,
+            "second capture skipped materialization",
+        );
+
+        // T3: B applies (key=1, H_B). Different hash, so B's capture materializes
+        // and writes back Applied{H_B}.
+        emit_and_take(&spec_b, input_b, vec![(1, 0xBBBB)])
+            .await?
+            .apply()
+            .await?;
+        assert_eq!(shared.applies_for(1), 2);
+
+        // T4: A's apply on the content-elided Effects. State is Applied{H_B} ≠
+        // H_A; capture had no content → run_apply returns Retry.
+        let err = effects_a_skipped.apply().await.expect_err("expected Retry");
+        assert!(
+            matches!(err, EffectsError::Retry),
+            "expected EffectsError::Retry, got {err:?}"
+        );
+        assert_eq!(
+            shared.applies_for(1),
+            2,
+            "Retry path must not run A's side effect",
+        );
+
+        // T5: Re-read A. capture sees Applied{H_B} ≠ H_A so it materializes
+        // content. Apply succeeds and writes back Applied{H_A}.
+        op_a.read_strongly_consistent().await?.apply().await?;
+        assert_eq!(
+            shared.applies_for(1),
+            3,
+            "fresh capture with content recovers A's apply",
+        );
+        assert!(
+            shared.captures_with_content() >= 2,
+            "recovery capture had to materialize at least once (storage diverged); got {}",
+            shared.captures_with_content(),
         );
 
         anyhow::Ok(())

@@ -924,11 +924,7 @@ impl FileSystem for DiskFileSystem {
 
         // Check if path is denied - if so, return an error
         if self.inner.is_path_denied(&fs_path) {
-            bail!(
-                "Cannot write to denied path: {path} in fs=[{fs}]",
-                path = fs_path.path,
-                fs = self.name()
-            );
+            turbobail!("Cannot write to denied path: {fs_path}");
         }
         let full_path = self.to_sys_path(&fs_path);
         let inner = self.inner.clone();
@@ -938,35 +934,38 @@ impl FileSystem for DiskFileSystem {
         // content is available in the persistent cache (via PersistedFileContent) and does not
         // require recomputing the content on cache restore — avoiding unnecessary downstream
         // recomputation.
-        //
-        // We also compute `content_hash` here so it's memoized by `write`'s own caching: if
-        // `content` is the same cell on a subsequent call, `write` doesn't re-run and we don't
-        // re-hash. Only the resolved Vc is stashed into the emitted effect — `capture()` does
-        // a second `.await` to materialize the ReadRef, which is a cache hit on the already-
-        // resolved cell. Storing the Vc (not a ReadRef) keeps the EffectInstance cell small
-        // and avoids pinning the PersistedFileContent cell across emit→apply.
         let content = content.persist().to_resolved().await?;
         let content_hash = u128::from_le_bytes(hash_xxh3_hash128(&*content.await?));
 
         #[derive(TraceRawVcs, NonLocalValue)]
-        struct WriteEffectEmit {
+        struct WriteEffect {
             full_path: PathBuf,
             inner: Arc<DiskFileSystemInner>,
             content: ResolvedVc<PersistedFileContent>,
             content_hash: u128,
         }
 
-        impl Effect for WriteEffectEmit {
-            type Captured = WriteEffectCaptured;
+        impl Effect for WriteEffect {
+            type Captured = CapturedWriteEffect;
 
-            async fn capture(&self) -> Result<WriteEffectCaptured> {
-                // Persist the file content so it is stored in the persistent cache.
-                // Since FileContent uses serialization = "hash", persisting it here ensures the
-                // full content is available in the persistent cache (via PersistedFileContent)
-                // and does not require recomputing the content on cache restore — avoiding
-                // unnecessary downstream recomputation.
-                let content = self.content.await?;
-                Ok(WriteEffectCaptured {
+            async fn capture(&self) -> Result<CapturedWriteEffect> {
+                // If the per-key effect state already records `Applied { value_hash }` matching
+                // our hash, skip materializing the content (avoids a possible disk read +
+                // decompression via the persistent cache). The apply-time state machine will
+                // dedup-hit before touching content. If state diverged between this read and
+                // apply, `Effects::apply` will fire our producer's invalidator via the Retry
+                // pathway and the producer will rerun with a fresh capture.
+                let key_bytes: Box<[u8]> = self.full_path.as_os_str().as_encoded_bytes().into();
+                let content = if self
+                    .inner
+                    .effect_state_storage
+                    .matches_applied(&key_bytes, self.content_hash)
+                {
+                    None
+                } else {
+                    Some(self.content.await?)
+                };
+                Ok(CapturedWriteEffect {
                     full_path: self.full_path.clone(),
                     inner: self.inner.clone(),
                     content,
@@ -976,16 +975,14 @@ impl FileSystem for DiskFileSystem {
         }
 
         #[derive(TraceRawVcs, NonLocalValue)]
-        struct WriteEffectCaptured {
+        struct CapturedWriteEffect {
             full_path: PathBuf,
             inner: Arc<DiskFileSystemInner>,
-            content: ReadRef<PersistedFileContent>,
+            content: Option<ReadRef<PersistedFileContent>>,
             content_hash: u128,
         }
 
-        impl CapturedEffect for WriteEffectCaptured {
-            type Error = AnyhowWrapper;
-
+        impl CapturedEffect for CapturedWriteEffect {
             fn key(&self) -> Box<[u8]> {
                 self.full_path.as_os_str().as_encoded_bytes().into()
             }
@@ -994,17 +991,35 @@ impl FileSystem for DiskFileSystem {
                 self.content_hash
             }
 
-            fn state_storage(&self) -> &EffectStateStorage {
-                &self.inner.effect_state_storage
-            }
-
-            async fn apply(&self) -> Result<(), AnyhowWrapper> {
-                self.apply_inner().await.map_err(AnyhowWrapper::from)
+            async fn apply(
+                &self,
+            ) -> Result<(), turbo_tasks::ApplyOutcome<Arc<dyn turbo_tasks::EffectError>>>
+            {
+                let body = self
+                    .content
+                    .as_ref()
+                    .map(|content| || self.apply_inner(content));
+                self.inner
+                    .effect_state_storage
+                    .run_apply::<AnyhowWrapper, _, _>(self.key(), self.content_hash, body)
+                    .await
             }
         }
 
-        impl WriteEffectCaptured {
-            async fn apply_inner(&self) -> anyhow::Result<()> {
+        impl CapturedWriteEffect {
+            async fn apply_inner(
+                &self,
+                content: &ReadRef<PersistedFileContent>,
+            ) -> Result<(), AnyhowWrapper> {
+                self.apply_inner_anyhow(content)
+                    .await
+                    .map_err(AnyhowWrapper::from)
+            }
+
+            async fn apply_inner_anyhow(
+                &self,
+                content: &ReadRef<PersistedFileContent>,
+            ) -> anyhow::Result<()> {
                 let full_path = validate_path_length(&self.full_path)?;
 
                 let _lock = self.inner.lock_path(&full_path).await;
@@ -1014,8 +1029,7 @@ impl FileSystem for DiskFileSystem {
                 // be freed immediately. Given this is an output file, it's unlikely any Turbo
                 // code will need to read the file from disk into a Vc<FileContent>, so we're
                 // not wasting cycles.
-                let compare = self
-                    .content
+                let compare = content
                     .streaming_compare(&full_path)
                     .instrument(tracing::info_span!("read file before write", name = ?full_path))
                     .concurrency_limited(&self.inner.read_semaphore)
@@ -1024,9 +1038,9 @@ impl FileSystem for DiskFileSystem {
                     return Ok(());
                 }
 
-                match &*self.content {
+                match &**content {
                     PersistedFileContent::Content(..) => {
-                        let content = self.content.clone();
+                        let content = content.clone();
                         let full_path = full_path.into_owned();
                         async {
                             let do_write = || {
@@ -1123,7 +1137,7 @@ impl FileSystem for DiskFileSystem {
             }
         }
 
-        emit_effect(WriteEffectEmit {
+        emit_effect(WriteEffect {
             full_path,
             inner,
             content,
@@ -1145,37 +1159,38 @@ impl FileSystem for DiskFileSystem {
 
         // Check if path is denied - if so, return an error
         if self.inner.is_path_denied(&fs_path) {
-            bail!(
-                "Cannot write to denied path: {path} in fs=[{fs}]",
-                path = fs_path.path,
-                fs = self.name()
-            );
+            turbobail!("Cannot write link to denied path: {fs_path}");
         }
-
         let full_path = self.to_sys_path(&fs_path);
         let inner = self.inner.clone();
 
-        // Resolve target + hash here so it's memoized by `write_link`'s own caching: if
-        // `target` is the same cell on a subsequent call, `write_link` doesn't re-run and we
-        // don't re-hash. Only the resolved Vc is stashed into the emitted effect — `capture()`
-        // does a second `.await` to materialize the ReadRef, which is a cache hit. Avoids
-        // pinning the LinkContent cell across emit→apply.
         let content_hash = u128::from_le_bytes(hash_xxh3_hash128(&*target.await?));
 
         #[derive(TraceRawVcs, NonLocalValue)]
-        struct WriteLinkEffectEmit {
+        struct WriteLinkEffect {
             full_path: PathBuf,
             inner: Arc<DiskFileSystemInner>,
             target: ResolvedVc<LinkContent>,
             content_hash: u128,
         }
 
-        impl Effect for WriteLinkEffectEmit {
-            type Captured = WriteLinkEffectCaptured;
+        impl Effect for WriteLinkEffect {
+            type Captured = CapturedWriteLinkEffect;
 
-            async fn capture(&self) -> Result<WriteLinkEffectCaptured> {
-                let content = self.target.await?;
-                Ok(WriteLinkEffectCaptured {
+            async fn capture(&self) -> Result<CapturedWriteLinkEffect> {
+                // Skip target materialization if the per-key effect state already records
+                // `Applied { value_hash }` matching our hash. See `WriteEffect::capture`.
+                let key_bytes: Box<[u8]> = self.full_path.as_os_str().as_encoded_bytes().into();
+                let content = if self
+                    .inner
+                    .effect_state_storage
+                    .matches_applied(&key_bytes, self.content_hash)
+                {
+                    None
+                } else {
+                    Some(self.target.await?)
+                };
+                Ok(CapturedWriteLinkEffect {
                     full_path: self.full_path.clone(),
                     inner: self.inner.clone(),
                     content,
@@ -1185,16 +1200,14 @@ impl FileSystem for DiskFileSystem {
         }
 
         #[derive(TraceRawVcs, NonLocalValue)]
-        struct WriteLinkEffectCaptured {
+        struct CapturedWriteLinkEffect {
             full_path: PathBuf,
             inner: Arc<DiskFileSystemInner>,
-            content: ReadRef<LinkContent>,
+            content: Option<ReadRef<LinkContent>>,
             content_hash: u128,
         }
 
-        impl CapturedEffect for WriteLinkEffectCaptured {
-            type Error = AnyhowWrapper;
-
+        impl CapturedEffect for CapturedWriteLinkEffect {
             fn key(&self) -> Box<[u8]> {
                 self.full_path.as_os_str().as_encoded_bytes().into()
             }
@@ -1203,17 +1216,35 @@ impl FileSystem for DiskFileSystem {
                 self.content_hash
             }
 
-            fn state_storage(&self) -> &EffectStateStorage {
-                &self.inner.effect_state_storage
-            }
-
-            async fn apply(&self) -> Result<(), AnyhowWrapper> {
-                self.apply_inner().await.map_err(AnyhowWrapper::from)
+            async fn apply(
+                &self,
+            ) -> Result<(), turbo_tasks::ApplyOutcome<Arc<dyn turbo_tasks::EffectError>>>
+            {
+                let body = self
+                    .content
+                    .as_ref()
+                    .map(|content| || self.apply_inner(content));
+                self.inner
+                    .effect_state_storage
+                    .run_apply::<AnyhowWrapper, _, _>(self.key(), self.content_hash, body)
+                    .await
             }
         }
 
-        impl WriteLinkEffectCaptured {
-            async fn apply_inner(&self) -> anyhow::Result<()> {
+        impl CapturedWriteLinkEffect {
+            async fn apply_inner(
+                &self,
+                content: &ReadRef<LinkContent>,
+            ) -> Result<(), AnyhowWrapper> {
+                self.apply_inner_anyhow(content)
+                    .await
+                    .map_err(AnyhowWrapper::from)
+            }
+
+            async fn apply_inner_anyhow(
+                &self,
+                content: &ReadRef<LinkContent>,
+            ) -> anyhow::Result<()> {
                 let full_path = validate_path_length(&self.full_path)?;
 
                 let _lock = self.inner.lock_path(&full_path).await;
@@ -1228,7 +1259,7 @@ impl FileSystem for DiskFileSystem {
                     Invalid,
                 }
 
-                let os_specific_link_content = match &*self.content {
+                let os_specific_link_content = match &**content {
                     LinkContent::Link { target, link_type } => {
                         let is_directory = link_type.contains(LinkType::DIRECTORY);
                         let target_path = if link_type.contains(LinkType::ABSOLUTE) {
@@ -1438,7 +1469,7 @@ impl FileSystem for DiskFileSystem {
             }
         }
 
-        emit_effect(WriteLinkEffectEmit {
+        emit_effect(WriteLinkEffect {
             full_path,
             inner,
             target,
